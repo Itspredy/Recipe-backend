@@ -1,7 +1,11 @@
+import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import youtubedl from 'youtube-dl-exec';
+
+const run = promisify(execFile);
 
 /**
  * Pulls whatever we can get from a social video URL without paying for anything:
@@ -36,28 +40,45 @@ export async function fetchMetadata(url) {
 }
 
 /**
- * Downloads just the audio track to a temp file. Returns the file contents plus
- * a cleanup function — the caller is responsible for calling it, and the file
- * never touches permanent storage.
+ * Downloads audio to a temp file and returns the contents plus a cleanup
+ * function — the caller is responsible for calling it, and nothing here
+ * touches permanent storage.
+ *
+ * Platforms like Instagram often don't expose an audio-only stream, so
+ * yt-dlp falls back to the full video. Whisper only needs the audio, and
+ * Groq rejects large uploads, so we always re-encode through ffmpeg to a
+ * small mono MP3 — a 30-60s clip shrinks from potentially tens of MB down
+ * to under 1MB, comfortably inside any API's size limit.
  */
 export async function downloadAudio(url) {
   const dir = await mkdtemp(join(tmpdir(), 'recipe-import-'));
-  const output = join(dir, 'audio.%(ext)s');
+  const rawOutput = join(dir, 'raw.%(ext)s');
 
   await youtubedl(url, {
     format: 'bestaudio[ext=m4a]/bestaudio/best',
-    output,
+    output: rawOutput,
     noWarnings: true,
     noCheckCertificates: true,
   });
 
   const { readdir } = await import('node:fs/promises');
-  const [filename] = await readdir(dir);
-  const path = join(dir, filename);
+  const [rawFilename] = await readdir(dir);
+  const rawPath = join(dir, rawFilename);
+  const compressedPath = join(dir, 'audio.mp3');
+
+  await run('ffmpeg', [
+    '-y',
+    '-i', rawPath,
+    '-vn', // drop any video stream
+    '-ac', '1', // mono
+    '-ar', '16000', // Whisper's native sample rate
+    '-b:a', '48k', // low bitrate is plenty for speech
+    compressedPath,
+  ]);
 
   return {
-    buffer: await readFile(path),
-    filename,
+    buffer: await readFile(compressedPath),
+    filename: 'audio.mp3',
     cleanup: () => rm(dir, { recursive: true, force: true }),
   };
 }
