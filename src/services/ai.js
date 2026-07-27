@@ -45,6 +45,7 @@ Rules:
 - Steps must be complete, actionable sentences in cooking order. Merge fragmented speech into coherent instructions.
 - Infer sensible prep/cook times when the source implies them; use null when there is genuinely no signal.
 - Never invent ingredients that are not mentioned or clearly visible in the source text.
+- Many cooking videos have little or no spoken narration — the audio may just be music, and the caption may only list ingredients. In that case you MUST still write "steps": use the ingredient list, the title, and standard technique for that dish to write a reasonable step-by-step method (e.g. "Turkish eggs" implies poach eggs, mix yogurt+garlic, fry butter+chilli, assemble). Never return an empty "steps" array when there is a real, identifiable dish — only leave it empty if you truly cannot tell what dish this is.
 - If the source is not a recipe at all, return {"error": "not_a_recipe"}.`;
 
 export async function structureRecipe({ caption, transcript, title }) {
