@@ -44,27 +44,46 @@ export async function fetchMetadata(url) {
  * function — the caller is responsible for calling it, and nothing here
  * touches permanent storage.
  *
- * Platforms like Instagram often don't expose an audio-only stream, so
- * yt-dlp falls back to the full video. Whisper only needs the audio, and
- * Groq rejects large uploads, so we always re-encode through ffmpeg to a
- * small mono MP3 — a 30-60s clip shrinks from potentially tens of MB down
- * to under 1MB, comfortably inside any API's size limit.
+ * Some Instagram/TikTok reels only expose a video-only stream (music baked
+ * into the video, no separate audio track), so we let yt-dlp download the
+ * best available and then use ffmpeg to extract audio if present. If there
+ * is no audio at all we return null so the caller can fall back to
+ * caption-only structuring instead of failing the whole import.
+ *
+ * Whisper only needs the audio and Groq rejects large uploads, so we always
+ * re-encode to a small mono MP3 — a 30-60s clip shrinks to well under 1MB.
  */
 export async function downloadAudio(url) {
   const dir = await mkdtemp(join(tmpdir(), 'recipe-import-'));
   const rawOutput = join(dir, 'raw.%(ext)s');
 
   await youtubedl(url, {
-    format: 'bestaudio[ext=m4a]/bestaudio/best',
+    format: 'bestaudio/best',
     output: rawOutput,
     noWarnings: true,
     noCheckCertificates: true,
   });
 
   const { readdir } = await import('node:fs/promises');
-  const [rawFilename] = await readdir(dir);
-  const rawPath = join(dir, rawFilename);
+  const files = await readdir(dir);
+  const rawPath = join(dir, files[0]);
   const compressedPath = join(dir, 'audio.mp3');
+
+  // Probe for an audio stream first — running ffmpeg on a video-only file
+  // wastes ~20s of CPU and then crashes with "Output file #0 does not
+  // contain any stream". Check up front instead.
+  const { stdout: streamKinds } = await run('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'a',
+    '-show_entries', 'stream=codec_type',
+    '-of', 'default=nw=1:nk=1',
+    rawPath,
+  ]);
+
+  if (!streamKinds.trim()) {
+    await rm(dir, { recursive: true, force: true });
+    return null;
+  }
 
   await run('ffmpeg', [
     '-y',

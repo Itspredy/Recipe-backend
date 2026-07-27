@@ -73,14 +73,21 @@ async function importRecipe(url) {
 
   // Skip the paid transcription step when the caption already spells out the recipe.
   let transcript = '';
+  let usedTranscription = false;
   const needsAudio = !captionLooksComplete(metadata.caption);
 
   if (needsAudio) {
+    // Some reels have music-only video with no separate audio stream;
+    // downloadAudio returns null in that case and we fall through to
+    // caption-only structuring rather than failing the whole import.
     const audio = await downloadAudio(url);
-    try {
-      transcript = await transcribe(audio);
-    } finally {
-      await audio.cleanup();
+    if (audio) {
+      try {
+        transcript = await transcribe(audio);
+        usedTranscription = true;
+      } finally {
+        await audio.cleanup();
+      }
     }
   }
 
@@ -96,7 +103,7 @@ async function importRecipe(url) {
     sourceUrl: url,
     platform,
     author: metadata.author,
-    usedTranscription: needsAudio,
+    usedTranscription,
   });
 }
 
