@@ -136,10 +136,13 @@ async function importRecipe(url) {
   // fail, which the app surfaces as "paste the caption instead".
   const { source, provider } = await fetchSource(url, platform);
 
-  // Skip the paid transcription step when the caption already spells out the recipe.
-  let transcript = '';
+  // Cheapest usable source of the spoken recipe, in order:
+  //   1. platform captions the scraper already returned (free)
+  //   2. the caption text itself, when it spells the recipe out (free)
+  //   3. downloading the media and paying Whisper (last resort)
+  let transcript = (source.transcript ?? '').trim();
   let usedTranscription = false;
-  const needsAudio = !captionLooksComplete(source.caption);
+  const needsAudio = !transcript && !captionLooksComplete(source.caption);
 
   if (needsAudio) {
     // Prefer the direct media URL the scraper handed us; otherwise let yt-dlp
