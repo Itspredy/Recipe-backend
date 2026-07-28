@@ -69,52 +69,60 @@ export async function fetchMetadata(url) {
  */
 export async function downloadAudio(url) {
   const dir = await mkdtemp(join(tmpdir(), 'recipe-import-'));
-  const rawOutput = join(dir, 'raw.%(ext)s');
 
-  await youtubedl(url, {
-    format: 'bestaudio/best',
-    output: rawOutput,
-    noWarnings: true,
-    noCheckCertificates: true,
-    ...ytdlpEnvOpts(),
-  });
+  // Any error between here and the successful return deletes the temp dir, so a
+  // downloaded video is never left on disk — nothing persists past this call.
+  try {
+    const rawOutput = join(dir, 'raw.%(ext)s');
 
-  const { readdir } = await import('node:fs/promises');
-  const files = await readdir(dir);
-  const rawPath = join(dir, files[0]);
-  const compressedPath = join(dir, 'audio.mp3');
+    await youtubedl(url, {
+      format: 'bestaudio/best',
+      output: rawOutput,
+      noWarnings: true,
+      noCheckCertificates: true,
+      ...ytdlpEnvOpts(),
+    });
 
-  // Probe for an audio stream first — running ffmpeg on a video-only file
-  // wastes ~20s of CPU and then crashes with "Output file #0 does not
-  // contain any stream". Check up front instead.
-  const { stdout: streamKinds } = await run('ffprobe', [
-    '-v', 'error',
-    '-select_streams', 'a',
-    '-show_entries', 'stream=codec_type',
-    '-of', 'default=nw=1:nk=1',
-    rawPath,
-  ]);
+    const { readdir } = await import('node:fs/promises');
+    const files = await readdir(dir);
+    const rawPath = join(dir, files[0]);
+    const compressedPath = join(dir, 'audio.mp3');
 
-  if (!streamKinds.trim()) {
+    // Probe for an audio stream first — running ffmpeg on a video-only file
+    // wastes ~20s of CPU and then crashes with "Output file #0 does not
+    // contain any stream". Check up front instead.
+    const { stdout: streamKinds } = await run('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'a',
+      '-show_entries', 'stream=codec_type',
+      '-of', 'default=nw=1:nk=1',
+      rawPath,
+    ]);
+
+    if (!streamKinds.trim()) {
+      await rm(dir, { recursive: true, force: true });
+      return null;
+    }
+
+    await run('ffmpeg', [
+      '-y',
+      '-i', rawPath,
+      '-vn', // drop any video stream
+      '-ac', '1', // mono
+      '-ar', '16000', // Whisper's native sample rate
+      '-b:a', '48k', // low bitrate is plenty for speech
+      compressedPath,
+    ]);
+
+    return {
+      buffer: await readFile(compressedPath),
+      filename: 'audio.mp3',
+      cleanup: () => rm(dir, { recursive: true, force: true }),
+    };
+  } catch (err) {
     await rm(dir, { recursive: true, force: true });
-    return null;
+    throw err;
   }
-
-  await run('ffmpeg', [
-    '-y',
-    '-i', rawPath,
-    '-vn', // drop any video stream
-    '-ac', '1', // mono
-    '-ar', '16000', // Whisper's native sample rate
-    '-b:a', '48k', // low bitrate is plenty for speech
-    compressedPath,
-  ]);
-
-  return {
-    buffer: await readFile(compressedPath),
-    filename: 'audio.mp3',
-    cleanup: () => rm(dir, { recursive: true, force: true }),
-  };
 }
 
 /**
@@ -124,36 +132,41 @@ export async function downloadAudio(url) {
  */
 export async function downloadAudioFromUrl(mediaUrl) {
   const dir = await mkdtemp(join(tmpdir(), 'recipe-import-'));
-  const rawPath = join(dir, 'raw.mp4');
-  const compressedPath = join(dir, 'audio.mp3');
 
-  const res = await fetch(mediaUrl);
-  if (!res.ok) {
+  // Same guarantee as downloadAudio: the temp dir is deleted on every path,
+  // so the fetched video is gone the moment we're done (or if anything fails).
+  try {
+    const rawPath = join(dir, 'raw.mp4');
+    const compressedPath = join(dir, 'audio.mp3');
+
+    const res = await fetch(mediaUrl);
+    if (!res.ok) throw new Error(`media download failed (${res.status})`);
+    await writeFile(rawPath, Buffer.from(await res.arrayBuffer()));
+
+    const { stdout: streamKinds } = await run('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'a',
+      '-show_entries', 'stream=codec_type',
+      '-of', 'default=nw=1:nk=1',
+      rawPath,
+    ]);
+
+    if (!streamKinds.trim()) {
+      await rm(dir, { recursive: true, force: true });
+      return null;
+    }
+
+    await run('ffmpeg', ['-y', '-i', rawPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', compressedPath]);
+
+    return {
+      buffer: await readFile(compressedPath),
+      filename: 'audio.mp3',
+      cleanup: () => rm(dir, { recursive: true, force: true }),
+    };
+  } catch (err) {
     await rm(dir, { recursive: true, force: true });
-    throw new Error(`media download failed (${res.status})`);
+    throw err;
   }
-  await writeFile(rawPath, Buffer.from(await res.arrayBuffer()));
-
-  const { stdout: streamKinds } = await run('ffprobe', [
-    '-v', 'error',
-    '-select_streams', 'a',
-    '-show_entries', 'stream=codec_type',
-    '-of', 'default=nw=1:nk=1',
-    rawPath,
-  ]);
-
-  if (!streamKinds.trim()) {
-    await rm(dir, { recursive: true, force: true });
-    return null;
-  }
-
-  await run('ffmpeg', ['-y', '-i', rawPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', compressedPath]);
-
-  return {
-    buffer: await readFile(compressedPath),
-    filename: 'audio.mp3',
-    cleanup: () => rm(dir, { recursive: true, force: true }),
-  };
 }
 
 /**
