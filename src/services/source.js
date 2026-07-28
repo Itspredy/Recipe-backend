@@ -1,11 +1,24 @@
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import youtubedl from 'youtube-dl-exec';
 
 const run = promisify(execFile);
+
+/**
+ * Extra yt-dlp options from the environment. A residential/mobile proxy is the
+ * single biggest lever for getting IG/TikTok to work from a cloud host, and a
+ * cookies file (a logged-in session export) is effectively required for most
+ * Instagram content. Both are optional — unset means "plain yt-dlp".
+ */
+function ytdlpEnvOpts() {
+  const opts = {};
+  if (process.env.YTDLP_PROXY) opts.proxy = process.env.YTDLP_PROXY;
+  if (process.env.YTDLP_COOKIES) opts.cookies = process.env.YTDLP_COOKIES;
+  return opts;
+}
 
 /**
  * Pulls whatever we can get from a social video URL without paying for anything:
@@ -28,6 +41,7 @@ export async function fetchMetadata(url) {
     noWarnings: true,
     noCheckCertificates: true,
     preferFreeFormats: true,
+    ...ytdlpEnvOpts(),
   });
 
   return {
@@ -62,6 +76,7 @@ export async function downloadAudio(url) {
     output: rawOutput,
     noWarnings: true,
     noCheckCertificates: true,
+    ...ytdlpEnvOpts(),
   });
 
   const { readdir } = await import('node:fs/promises');
@@ -94,6 +109,45 @@ export async function downloadAudio(url) {
     '-b:a', '48k', // low bitrate is plenty for speech
     compressedPath,
   ]);
+
+  return {
+    buffer: await readFile(compressedPath),
+    filename: 'audio.mp3',
+    cleanup: () => rm(dir, { recursive: true, force: true }),
+  };
+}
+
+/**
+ * Downloads a direct media URL (the one a managed scraper hands back) and
+ * extracts a small mono MP3 for Whisper — same output contract as downloadAudio,
+ * but no yt-dlp involved. Returns null when the media has no audio track.
+ */
+export async function downloadAudioFromUrl(mediaUrl) {
+  const dir = await mkdtemp(join(tmpdir(), 'recipe-import-'));
+  const rawPath = join(dir, 'raw.mp4');
+  const compressedPath = join(dir, 'audio.mp3');
+
+  const res = await fetch(mediaUrl);
+  if (!res.ok) {
+    await rm(dir, { recursive: true, force: true });
+    throw new Error(`media download failed (${res.status})`);
+  }
+  await writeFile(rawPath, Buffer.from(await res.arrayBuffer()));
+
+  const { stdout: streamKinds } = await run('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'a',
+    '-show_entries', 'stream=codec_type',
+    '-of', 'default=nw=1:nk=1',
+    rawPath,
+  ]);
+
+  if (!streamKinds.trim()) {
+    await rm(dir, { recursive: true, force: true });
+    return null;
+  }
+
+  await run('ffmpeg', ['-y', '-i', rawPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', compressedPath]);
 
   return {
     buffer: await readFile(compressedPath),

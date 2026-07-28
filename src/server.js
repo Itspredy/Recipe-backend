@@ -3,7 +3,8 @@ import cors from 'cors';
 import express from 'express';
 import { categorise } from './services/categories.js';
 import { structureRecipe, transcribe } from './services/ai.js';
-import { captionLooksComplete, detectPlatform, downloadAudio, fetchMetadata } from './services/source.js';
+import { captionLooksComplete, detectPlatform, downloadAudio, downloadAudioFromUrl } from './services/source.js';
+import { fetchSource } from './services/fetchers.js';
 import { parseRecipeWebsite } from './services/website.js';
 
 const app = express();
@@ -51,6 +52,39 @@ app.post('/import', async (req, res) => {
   }
 });
 
+/**
+ * Manual fallback: the user pastes the caption / recipe text (e.g. copied from a
+ * reel we couldn't scrape) and Groq structures it. This is the escape hatch that
+ * means an import can never hard-fail on the user.
+ */
+app.post('/structure', async (req, res) => {
+  const { text, title } = req.body ?? {};
+
+  if (!text || typeof text !== 'string' || text.trim().length < 20) {
+    return res.status(400).json({ error: 'Paste the recipe text — ingredients and steps.' });
+  }
+
+  try {
+    const recipe = await structureRecipe({ caption: text, transcript: '', title: title ?? '' });
+    res.json(
+      buildResponse({
+        recipe,
+        thumbnail: null,
+        sourceUrl: null,
+        platform: 'manual',
+        author: null,
+        usedTranscription: false,
+        provider: 'manual',
+      }),
+    );
+  } catch (error) {
+    console.error('[structure] failed:', error);
+    res.status(error.status ?? 500).json({
+      error: error.status ? error.message : "Couldn't read a recipe from that text.",
+    });
+  }
+});
+
 async function importRecipe(url) {
   const platform = detectPlatform(url);
 
@@ -69,56 +103,64 @@ async function importRecipe(url) {
     }
   }
 
-  const metadata = await fetchMetadata(url);
+  // Social links: prefer a managed scraper (survives IG/TikTok blocks from a
+  // cloud host), fall back to yt-dlp. Throws with a manual-paste hint if both
+  // fail, which the app surfaces as "paste the caption instead".
+  const { source, provider } = await fetchSource(url, platform);
 
   // Skip the paid transcription step when the caption already spells out the recipe.
   let transcript = '';
   let usedTranscription = false;
-  const needsAudio = !captionLooksComplete(metadata.caption);
+  const needsAudio = !captionLooksComplete(source.caption);
 
   if (needsAudio) {
-    // Some reels have music-only video with no separate audio stream;
-    // downloadAudio returns null in that case and we fall through to
-    // caption-only structuring rather than failing the whole import.
-    const audio = await downloadAudio(url);
-    if (audio) {
-      try {
+    // Prefer the direct media URL the scraper handed us; otherwise let yt-dlp
+    // pull the audio. Either can return null (music-only / no audio), in which
+    // case we fall through to caption-only structuring rather than failing.
+    let audio = null;
+    try {
+      audio = source.videoUrl ? await downloadAudioFromUrl(source.videoUrl) : await downloadAudio(url);
+      if (audio) {
         transcript = await transcribe(audio);
         usedTranscription = true;
-      } finally {
-        await audio.cleanup();
       }
+    } catch (err) {
+      console.warn('[import] transcription skipped:', err.message);
+    } finally {
+      if (audio) await audio.cleanup();
     }
   }
 
   const recipe = await structureRecipe({
-    caption: metadata.caption,
+    caption: source.caption,
     transcript,
-    title: metadata.title,
+    title: source.title,
   });
 
   return buildResponse({
     recipe,
-    thumbnail: metadata.thumbnail,
+    thumbnail: source.thumbnail,
     sourceUrl: url,
     platform,
-    author: metadata.author,
+    author: source.author,
     usedTranscription,
+    provider,
   });
 }
 
-function buildResponse({ recipe, thumbnail, sourceUrl, platform, author, usedTranscription }) {
+function buildResponse({ recipe, thumbnail, sourceUrl, platform, author, usedTranscription, provider }) {
   return {
     ...recipe,
     ingredients: recipe.ingredients.map((ingredient) => ({
       ...ingredient,
       category: categorise(ingredient.name),
     })),
-    imageUrl: thumbnail,
-    sourceUrl,
+    imageUrl: thumbnail ?? null,
+    sourceUrl: sourceUrl ?? null,
     sourcePlatform: platform,
-    sourceAuthor: author,
-    usedTranscription,
+    sourceAuthor: author ?? null,
+    usedTranscription: usedTranscription ?? false,
+    provider: provider ?? null,
   };
 }
 
